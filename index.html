@@ -76,6 +76,7 @@
     .stage { position: relative; aspect-ratio: 1; border-radius: 18px; overflow: hidden; background: rgba(0,0,0,.35); display: grid; place-items: center; }
     .you .stage { border: 3px solid rgba(46, 230, 166, .5); } .cpu .stage { border: 3px solid rgba(255, 79, 139, .5); }
     #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+    #skeleton { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; }
     .frame { position: absolute; inset: 14%; border: 2px dashed rgba(255,255,255,.5); border-radius: 16px; z-index: 2; pointer-events: none; }
     #placeholder { text-align: center; color: var(--muted); padding: 20px; }
     #placeholder b { display: block; font-size: 3.4rem; margin-bottom: 6px; }
@@ -194,6 +195,7 @@
           <span class="frame" id="frame" hidden></span>
           <p id="placeholder"><b>📷</b>아래 '웹캠 시작'을 누르고<br>손을 점선 안에 보여주세요.</p>
           <video id="video" autoplay muted playsinline aria-label="실시간 웹캠 영상" hidden></video>
+          <canvas id="skeleton" width="400" height="400" aria-hidden="true" hidden></canvas>
           <div class="lock" id="you-lock" hidden></div>
         </div>
         <div class="now">
@@ -296,7 +298,9 @@
       const cameraSelect = $("camera-select");
       let stream = null, opening = false, mode = "idle", inputEpoch = 0;
       let cameraTimer = null, cameraHint = null, inference = null;
-      let model = null, modelLoading = false, modelTask = 0, autoAttempted = false, libraryPromise = null;
+      let model = null, modelLoading = false, modelTask = 0, autoAttempted = false;
+      let modelKind = "image"; const libraryPromises = {}; // "image" = 이미지 프로젝트, "pose" = 포즈 프로젝트
+      const skeletonCtx = $("skeleton").getContext("2d");
       let frameState = "waiting", frameStateSince = 0, frameMessage = "";
       let cameraName = "카메라", lastVideoTime = -1, lastVideoAdvance = 0;
       let smoothed = [], labels = [], current = null; // current = { move, className, percent }
@@ -407,7 +411,7 @@
         lastVideoTime = -1; lastVideoAdvance = 0;
         video.pause(); video.srcObject = null; video.hidden = true;
         $("frame").hidden = true; $("placeholder").hidden = false;
-        mode = "idle"; smoothed = []; current = null; showNow();
+        mode = "idle"; smoothed = []; current = null; showNow(); skeletonCtx.clearRect(0, 0, 400, 400);
         if (phase === "countdown") cancelRound("카메라가 꺼져서 라운드를 취소했어요.");
         buttons();
       }
@@ -469,18 +473,35 @@
           document.head.append(s);
         });
       }
-      async function ensureLibraries() {
-        if (window.tf && window.tmImage) return;
-        if (!libraryPromise) libraryPromise = (async () => {
-          for (const [g, file] of [["tf", "@tensorflow/tfjs@1.3.1/dist/tf.min.js"], ["tmImage", "@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"]]) {
+      // 이미지 모델과 포즈 모델은 서로 다른 라이브러리를 씁니다.
+      const LIBS = {
+        image: ["tmImage", "@teachablemachine/image@0.8.5/dist/teachablemachine-image.min.js"],
+        pose:  ["tmPose",  "@teachablemachine/pose@0.8.6/dist/teachablemachine-pose.min.js"]
+      };
+      async function ensureLibraries(kind) {
+        const [globalName] = LIBS[kind];
+        if (window.tf && window[globalName]) return;
+        if (!libraryPromises[kind]) libraryPromises[kind] = (async () => {
+          for (const [g, file] of [["tf", "@tensorflow/tfjs@1.3.1/dist/tf.min.js"], LIBS[kind]]) {
             if (window[g]) continue;
             try { await loadScript("https://cdn.jsdelivr.net/npm/" + file); }
             catch { if (!window[g]) await loadScript("https://unpkg.com/" + file); }
             if (!window[g]) throw new Error("AI 라이브러리 초기화 실패");
           }
         })();
-        try { await libraryPromise; }
-        catch { libraryPromise = null; throw new Error("AI 실행 도구를 불러오지 못했습니다. 인터넷 연결이나 학교 네트워크 차단 여부를 확인해주세요."); }
+        try { await libraryPromises[kind]; }
+        catch { libraryPromises[kind] = null; throw new Error("AI 실행 도구를 불러오지 못했습니다. 인터넷 연결이나 학교 네트워크 차단 여부를 확인해주세요."); }
+      }
+      // metadata.json을 읽어 이미지 모델인지 포즈 모델인지 판단합니다.
+      function kindOf(meta) {
+        const text = JSON.stringify(meta || {}).toLowerCase();
+        return text.includes("teachablemachine/pose") || meta?.modelSettings?.posenet ? "pose" : "image";
+      }
+      async function readMeta(fileOrUrl) {
+        try {
+          if (typeof fileOrUrl === "string") { const r = await fetch(fileOrUrl, { cache: "no-store" }); return r.ok ? await r.json() : null; }
+          return JSON.parse(await fileOrUrl.text());
+        } catch { return null; }
       }
       async function connectModel(files) {
         const task = ++modelTask; modelLoading = true; autoAttempted = true;
@@ -499,12 +520,21 @@
             weights = files.filter((f) => f.name.endsWith(".bin"));
             if (!topology || !metadata || weights.length !== 1) throw new Error("model.json, metadata.json, 가중치(.bin) 파일 1개를 한 번에 선택해주세요.");
           }
-          await ensureLibraries();
-          if (task !== modelTask) return;
-          if (files) candidate = await tmImage.loadFromFiles(topology, weights[0], metadata);
+          let kind = "image";
+          if (files) kind = kindOf(await readMeta(metadata));
           else {
             for (const base of [...new Set([MODEL_BASE, "./"])]) {
-              try { candidate = await tmImage.load(base + "model.json", base + "metadata.json"); break; }
+              const meta = await readMeta(base + "metadata.json");
+              if (meta) { kind = kindOf(meta); break; }
+            }
+          }
+          await ensureLibraries(kind);
+          if (task !== modelTask) return;
+          const lib = kind === "pose" ? window.tmPose : window.tmImage;
+          if (files) candidate = await lib.loadFromFiles(topology, weights[0], metadata);
+          else {
+            for (const base of [...new Set([MODEL_BASE, "./"])]) {
+              try { candidate = await lib.load(base + "model.json", base + "metadata.json"); break; }
               catch (error) { console.warn("모델 경로 확인:", base, error); }
             }
             if (!candidate) throw new Error("학습 모델을 찾지 못했습니다. '모델 파일 연결'로 파일 3개를 선택하거나 GitHub의 model 폴더를 확인해주세요.");
@@ -513,11 +543,15 @@
           const modelLabels = candidate.getClassLabels();
           if (!Array.isArray(modelLabels) || !modelLabels.length) throw new Error("분류 이름이 없는 모델입니다.");
           const missing = Object.keys(MOVES).filter((m) => !modelLabels.some((l) => moveOf(l) === m));
-          model = candidate; labels = modelLabels; smoothed = [];
+          model = candidate; labels = modelLabels; smoothed = []; modelKind = kind;
+          $("skeleton").hidden = kind !== "pose";
+          skeletonCtx.clearRect(0, 0, 400, 400);
           modelLoading = false;
           if (missing.length) modelStatus("⚠️ 연결은 됐지만 " + missing.map((m) => MOVES[m].label).join("·") + " 클래스를 찾지 못했어요. 클래스 이름: " + modelLabels.join(" / ") + " → 코드 맨 위 MOVES를 수정하세요.", true);
-          else modelStatus("✅ 모델 연결 완료 · " + modelLabels.join(" / "));
-          if (mode === "camera") banner("준비 완료!", "'게임 시작'을 누르거나 Space 키를 누르세요.");
+          else modelStatus("✅ " + (kind === "pose" ? "포즈 모델" : "이미지 모델") + " 연결 완료 · " + modelLabels.join(" / "));
+          if (mode === "camera") banner("준비 완료!", kind === "pose"
+            ? "포즈 모델은 손가락이 아니라 팔·몸 동작을 읽어요. 1~2m 떨어져 상체가 보이게 서세요."
+            : "'게임 시작'을 누르거나 Space 키를 누르세요.");
         } catch (error) {
           if (candidate && candidate !== model) dispose(candidate);
           if (task === modelTask) { console.error(error); modelStatus(error.message || "모델을 연결하지 못했습니다.", true); }
@@ -536,7 +570,17 @@
         if (!model || modelLoading || inference || epoch !== inputEpoch || frameState !== "ready") return;
         const activeModel = model, activeTask = modelTask;
         if (!(video.readyState >= 2 && crop(video, video.videoWidth, video.videoHeight, MIRROR_CAMERA, inputCtx))) return;
-        const job = Promise.resolve().then(() => activeModel.predict(inputCanvas));
+        const job = Promise.resolve().then(async () => {
+          if (modelKind !== "pose") return activeModel.predict(inputCanvas);
+          // 포즈 모델: 먼저 몸의 관절을 찾고, 그 관절 정보로 동작을 분류합니다.
+          const { pose, posenetOutput } = await activeModel.estimatePose(inputCanvas);
+          skeletonCtx.clearRect(0, 0, 400, 400);
+          if (pose && window.tmPose) {
+            tmPose.drawKeypoints(pose.keypoints, 0.5, skeletonCtx, 6, "#2ee6a6", "#ffffff");
+            tmPose.drawSkeleton(pose.keypoints, 0.5, skeletonCtx, 4, "#2ee6a6");
+          }
+          return activeModel.predict(posenetOutput);
+        });
         inference = job;
         try {
           const predictions = await job;
@@ -547,7 +591,8 @@
           current = { move: moveOf(predictions[best].className), className: predictions[best].className, percent: smoothed[best] * 100 };
           showNow();
         } catch (error) {
-          if (epoch === inputEpoch && activeTask === modelTask) { model = null; dispose(activeModel); modelStatus("AI 분석 오류: " + (error.message || "모델을 다시 연결해주세요."), true); buttons(); }
+          if (epoch === inputEpoch && activeTask === modelTask) { model = null; dispose(activeModel); const msg = /dimension|shape/i.test(error.message || "") ? "모델 종류와 페이지가 맞지 않습니다. 모델을 다시 연결해주세요." : (error.message || "모델을 다시 연결해주세요.");
+            modelStatus("AI 분석 오류: " + msg, true); buttons(); }
         } finally { if (inference === job) inference = null; }
       }
       async function cameraLoop(epoch) {
